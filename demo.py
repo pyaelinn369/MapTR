@@ -1,0 +1,181 @@
+import sys
+import os
+# Force Python to look in the current root directory for custom modules
+sys.path.append(os.path.abspath('.'))
+
+import torch
+# --- NEW FIX: CUDA 11.1 / Ampere GPU Hardware Patch ---
+# Intercepts GPU matrix inversion and forces it to happen safely on the CPU
+_original_inverse = torch.inverse
+def _safe_inverse(x):
+    return _original_inverse(x.cpu()).to(x.device)
+torch.inverse = _safe_inverse
+# ------------------------------------------------------
+
+import cv2
+import numpy as np
+from mmcv import Config
+from mmcv.utils import import_modules_from_strings
+from mmdet3d.apis import init_model
+
+# Argoverse 2 Class Colors (BGR format for OpenCV)
+COLOR_MAPS_BGR = {
+    0: (54, 137, 255),  # divider (Orange)
+    1: (255, 0, 0),     # ped_crossing (Blue)
+    2: (0, 0, 255),     # boundary (Red)
+    3: (0, 255, 0)      # centerline (Green) - if applicable
+}
+
+def main():
+    # --- Configuration ---
+    config_path = './projects/configs/maptrv2/maptrv2_av2_3d_r50_6ep.py' 
+    checkpoint_path = './pretrained/maptrv2_av2_3d_r50_6ep.pth'
+    video_path = './test_video.webm'
+    output_path = './outputs/maptrv2_demo_output.mp4'
+    device = 'cuda:0'
+    score_thresh = 0.3
+    
+    # Ensure output directory exists
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+    # --- Register MapTRv2 Modules ---
+    cfg = Config.fromfile(config_path)
+    custom_imports = cfg.get('custom_imports', None)
+    if custom_imports is not None:
+        import_modules_from_strings(**custom_imports)
+    else:
+        import_modules_from_strings(**dict(imports=['projects.mmdet3d_plugin.maptr.modules']))
+        
+    # --- Initialize Model ---
+    print("Loading model weights... (This may take a moment)")
+    model = init_model(config_path, checkpoint_path, device=device)
+    model.eval()
+    print("Model loaded successfully!")
+
+    # --- Setup Video I/O ---
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise ValueError(f"Could not open video: {video_path}")
+        
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if fps == 0 or np.isnan(fps):
+        fps = 30.0
+
+    # Output video dimensions (Side-by-side: [Video Frame] | [BEV Map])
+    target_h, target_w = 576, 1024
+    bev_size = 600
+    out_width = target_w + bev_size
+    out_height = max(target_h, bev_size)
+    
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out_video = cv2.VideoWriter(output_path, fourcc, fps, (out_width, out_height))
+
+    print(f"Processing video. Output will be saved to: {output_path}")
+    frame_count = 0
+
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+            
+        frame_count += 1
+        print(f"\rProcessing frame {frame_count}...", end="")
+
+        # 1. Preprocess the input frame
+        frame_resized = cv2.resize(frame, (target_w, target_h))
+        rgb_frame = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
+        
+        # ImageNet Normalization
+        norm_frame = (rgb_frame - np.array([123.675, 116.28, 103.53])) / np.array([58.395, 57.12, 57.375])
+        
+        # 2. Fabricate the 6-camera input required by MapTRv2
+        blank_frame = np.zeros_like(norm_frame)
+        multi_view_frames = [norm_frame, blank_frame, blank_frame, blank_frame, blank_frame, blank_frame]
+        
+        # Shape: [batch(1), views(6), channels(3), H, W]
+        img_tensor = torch.tensor(np.stack(multi_view_frames)).permute(0, 3, 1, 2).float().to(device)
+        
+        # 3. Fabricate dummy camera geometry matrices
+        dummy_matrix = np.eye(4, dtype=np.float32)
+        lidar2img_matrices = [dummy_matrix] * 6
+        
+        # 4. Wrap everything into the expected data-container dict
+        data = {
+            'img': [img_tensor],
+            'img_metas': [[{
+                'box_type_3d': None,
+                # --- NEW FIX: Explicitly set the 3-channel tuple ---
+                'img_shape': [(target_h, target_w, 3) for _ in range(6)],
+                'pad_shape': [(target_h, target_w, 3) for _ in range(6)],
+                # ----------------------------------------------------
+                'scale_factor': [1.0] * 6,
+                'flip': False,
+                'pcd_horizontal_flip': False,
+                'pcd_vertical_flip': False,
+                'scene_token': 'custom_video_sequence', 
+                'can_bus': np.zeros(18, dtype=np.float32), 
+                'lidar2img': lidar2img_matrices,
+                'camera2ego': [np.eye(4, dtype=np.float32) for _ in range(6)],
+                'camera_intrinsics': [np.eye(4, dtype=np.float32) for _ in range(6)], 
+                'img_aug_matrix': [np.eye(4, dtype=np.float32) for _ in range(6)],   
+                'lidar2ego': np.eye(4, dtype=np.float32),
+                'ego2global': np.eye(4, dtype=np.float32),
+                'lidar2global': np.eye(4, dtype=np.float32),
+            }]]
+        }
+        
+        # 4. Run Inference
+        with torch.no_grad():
+            results = model(return_loss=False, rescale=True, **data)
+            
+        # 5. Extract Predictions
+        predictions = results[0]['pts_bbox']
+        scores = predictions['scores_3d']
+        labels = predictions['labels_3d']
+        pts = predictions['pts_3d']
+        
+        valid_mask = scores > score_thresh
+        
+        # 6. Render BEV Map
+        bev_canvas = np.zeros((bev_size, bev_size, 3), dtype=np.uint8)
+        
+        # Draw a simple car in the center of the BEV map
+        center_x, center_y = bev_size // 2, bev_size // 2
+        cv2.rectangle(bev_canvas, (center_x - 10, center_y - 20), (center_x + 10, center_y + 20), (255, 255, 255), -1)
+        
+        for score, label, polyline in zip(scores[valid_mask], labels[valid_mask], pts[valid_mask]):
+            polyline = polyline.cpu().numpy()
+            label_idx = label.item()
+            
+            # Map physical meters (e.g., -30m to +30m) to the BEV pixel canvas (0 to 600px)
+            # Scale factor: 10 pixels per meter.
+            pixel_points = []
+            for pt in polyline:
+                x_px = int(center_x + pt[0] * 10)
+                y_px = int(center_y - pt[1] * 10)
+                pixel_points.append([x_px, y_px])
+                
+            pts_array = np.array(pixel_points, np.int32).reshape((-1, 1, 2))
+            color = COLOR_MAPS_BGR.get(label_idx, (255, 255, 255))
+            
+            cv2.polylines(bev_canvas, [pts_array], isClosed=False, color=color, thickness=2, lineType=cv2.LINE_AA)
+
+        # 7. Stitch images side-by-side
+        final_canvas = np.zeros((out_height, out_width, 3), dtype=np.uint8)
+        
+        # Place video frame on the left (vertically centered if smaller than BEV)
+        y_offset = (out_height - target_h) // 2
+        final_canvas[y_offset:y_offset+target_h, :target_w] = frame_resized
+        
+        # Place BEV map on the right
+        final_canvas[:bev_size, target_w:] = bev_canvas
+        
+        # Write to video
+        out_video.write(final_canvas)
+
+    print("\nVideo processing complete!")
+    cap.release()
+    out_video.release()
+
+if __name__ == '__main__':
+    main()
