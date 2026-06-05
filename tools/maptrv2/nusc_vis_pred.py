@@ -3,6 +3,15 @@ import mmcv
 import os
 import shutil
 import torch
+
+# --- NEW FIX: CUDA 11.1 / Ampere GPU Hardware Patch ---
+# Intercepts GPU matrix inversion and forces it to happen safely on the CPU
+_original_inverse = torch.inverse
+def _safe_inverse(x):
+    return _original_inverse(x.cpu()).to(x.device)
+torch.inverse = _safe_inverse
+# ------------------------------------------------------
+
 import warnings
 from mmcv import Config, DictAction
 from mmcv.cnn import fuse_conv_bn
