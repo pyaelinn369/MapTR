@@ -13,7 +13,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description='vis hdmaptr map gt label')
     parser.add_argument('visdir', help='visualize directory')
     # parser.add_argument('checkpoint', help='checkpoint file')
-    parser.add_argument('--fps', default=10, type=int, help='fps to generate video')
+    parser.add_argument('--fps', default=5, type=int, help='fps to generate video')
     parser.add_argument('--video-name', default='demo',type=str)
     parser.add_argument('--sample-name', default='SAMPLE_VIS.jpg', type=str)
     args = parser.parse_args()

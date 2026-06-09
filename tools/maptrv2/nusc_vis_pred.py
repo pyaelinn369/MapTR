@@ -80,6 +80,155 @@ def perspective(cam_coords, proj_mat):
     pix_coords = pix_coords.transpose(1, 0)
     return pix_coords
 
+
+COLOR_MAPS_BGR = {
+    'ped_crossing': (255, 0, 0),
+    'divider': (0, 165, 255),
+    'boundary': (0, 0, 255),
+    'centerline': (0, 255, 0),
+}
+
+LEGEND_ITEMS = [
+    ('ped_crossing', 'ped_crossing'),
+    ('divider', 'divider'),
+    ('boundary', 'boundary'),
+    ('centerline', 'centerline'),
+]
+
+
+def remove_nan_values(uv):
+    is_u_valid = np.logical_not(np.isnan(uv[:, 0]))
+    is_v_valid = np.logical_not(np.isnan(uv[:, 1]))
+    is_uv_valid = np.logical_and(is_u_valid, is_v_valid)
+    return uv[is_uv_valid]
+
+
+def points_ego2img(pts_ego, lidar2img):
+    pts_ego_4d = np.concatenate([pts_ego, np.ones([len(pts_ego), 1])], axis=-1)
+    pts_img_4d = lidar2img @ pts_ego_4d.T
+    uv = pts_img_4d.T
+    uv = remove_nan_values(uv)
+    depth = uv[:, 2]
+    uv = uv[:, :2] / uv[:, 2].reshape(-1, 1)
+    return uv, depth
+
+
+def draw_visible_polyline_cv2(line, valid_pts_bool, image, color, thickness_px):
+    line = np.round(line).astype(int)
+    for i in range(len(line) - 1):
+        if (not valid_pts_bool[i]) or (not valid_pts_bool[i + 1]):
+            continue
+        x1 = line[i][0]
+        y1 = line[i][1]
+        x2 = line[i + 1][0]
+        y2 = line[i + 1][1]
+        image = cv2.line(
+            image,
+            pt1=(x1, y1),
+            pt2=(x2, y2),
+            color=color,
+            thickness=thickness_px,
+            lineType=cv2.LINE_AA,
+        )
+    return image
+
+
+def draw_polyline_ego_on_img(polyline_ego, img_bgr, lidar2img, map_class, thickness=4, base_z=0.0):
+    if polyline_ego.shape[1] == 2:
+        z_values = np.full((polyline_ego.shape[0], 1), base_z, dtype=polyline_ego.dtype)
+        polyline_ego = np.concatenate([polyline_ego, z_values], axis=1)
+
+    uv, depth = points_ego2img(polyline_ego, lidar2img)
+    if len(uv) < 2:
+        return img_bgr
+
+    h, w, _ = img_bgr.shape
+    is_valid_x = np.logical_and(0 <= uv[:, 0], uv[:, 0] < w - 1)
+    is_valid_y = np.logical_and(0 <= uv[:, 1], uv[:, 1] < h - 1)
+    is_valid_z = depth > 0
+    is_valid_points = np.logical_and.reduce([is_valid_x, is_valid_y, is_valid_z])
+
+    if is_valid_points.sum() == 0:
+        return img_bgr
+
+    tmp_list = []
+    for i, valid in enumerate(is_valid_points):
+        if valid:
+            tmp_list.append(uv[i])
+        else:
+            if len(tmp_list) >= 2:
+                tmp_vector = np.stack(tmp_list)
+                tmp_vector = np.round(tmp_vector).astype(np.int32)
+                img_bgr = draw_visible_polyline_cv2(
+                    tmp_vector,
+                    valid_pts_bool=np.ones((len(tmp_vector),), dtype=bool),
+                    image=img_bgr,
+                    color=COLOR_MAPS_BGR[map_class],
+                    thickness_px=thickness,
+                )
+            tmp_list = []
+
+    if len(tmp_list) >= 2:
+        tmp_vector = np.stack(tmp_list)
+        tmp_vector = np.round(tmp_vector).astype(np.int32)
+        img_bgr = draw_visible_polyline_cv2(
+            tmp_vector,
+            valid_pts_bool=np.ones((len(tmp_vector),), dtype=bool),
+            image=img_bgr,
+            color=COLOR_MAPS_BGR[map_class],
+            thickness_px=thickness,
+        )
+
+    return img_bgr
+
+
+def render_anno_on_pv(cam_img, anno, lidar2img, base_z=0.0):
+    for key, value in anno.items():
+        for pts in value:
+            cam_img = draw_polyline_ego_on_img(pts, cam_img, lidar2img, key, thickness=4, base_z=base_z)
+    return cam_img
+
+
+def add_legend(canvas, items):
+    legend_h = 72
+    legend_canvas = np.full((legend_h, canvas.shape[1], 3), 255, dtype=np.uint8)
+    x = 20
+    y = 20
+    swatch = 16
+    gap = 24
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    for key, label in items:
+        color = COLOR_MAPS_BGR[key]
+        cv2.rectangle(legend_canvas, (x, y), (x + swatch, y + swatch), color, -1)
+        cv2.rectangle(legend_canvas, (x, y), (x + swatch, y + swatch), (0, 0, 0), 1)
+        cv2.putText(legend_canvas, label, (x + swatch + 8, y + 13), font, 0.45, (0, 0, 0), 1, cv2.LINE_AA)
+        label_w = cv2.getTextSize(label, font, 0.45, 1)[0][0]
+        x += swatch + 8 + label_w + gap
+    return np.vstack([canvas, legend_canvas])
+
+
+def build_overlay_canvas(rendered_cams):
+    row_1_img = cv2.hconcat([rendered_cams[cam] for cam in CAMS[:3]])
+    row_2_img = cv2.hconcat([rendered_cams[cam] for cam in CAMS[3:]])
+    cams_img = cv2.vconcat([row_1_img, row_2_img])
+    return add_legend(cams_img, LEGEND_ITEMS)
+
+
+def build_raw_lidar2img(img_meta, cam_idx):
+    lidar2ego = np.asarray(img_meta['lidar2ego'], dtype=np.float32)
+    camera2ego = np.asarray(img_meta['camera2ego'][cam_idx], dtype=np.float32)
+    cam_intrinsic = np.asarray(img_meta['cam_intrinsic'][cam_idx], dtype=np.float32)
+
+    ego2cam = np.linalg.inv(camera2ego)
+    lidar2cam = ego2cam @ lidar2ego
+    lidar2img = cam_intrinsic @ lidar2cam
+
+    if lidar2img.shape == (3, 4):
+        lidar2img_4x4 = np.eye(4, dtype=np.float32)
+        lidar2img_4x4[:3, :4] = lidar2img
+        return lidar2img_4x4
+    return lidar2img
+
 def parse_args():
     parser = argparse.ArgumentParser(description='vis hdmaptr map gt label')
     parser.add_argument('config', help='test config file path')
@@ -262,6 +411,28 @@ def main():
             # img_path_list.append(img_path)
             shutil.copyfile(filepath,img_path)
             img_path_dict[filename_splits[1]] = img_path
+
+        result_dic = result[0]['pts_bbox']
+        boxes_3d = result_dic['boxes_3d']
+        scores_3d = result_dic['scores_3d']
+        labels_3d = result_dic['labels_3d']
+        pts_3d = result_dic['pts_3d']
+        keep = scores_3d > args.score_thresh
+        pred_dict = {'divider': [], 'ped_crossing': [], 'boundary': [], 'centerline': []}
+        class_by_index = ['divider', 'ped_crossing', 'boundary', 'centerline']
+        for pred_score_3d, pred_bbox_3d, pred_label_3d, pred_pts_3d in zip(
+                scores_3d[keep], boxes_3d[keep], labels_3d[keep], pts_3d[keep]):
+            pred_pts_3d = pred_pts_3d.numpy()
+            pred_dict[class_by_index[int(pred_label_3d)]].append(pred_pts_3d)
+
+        overlay_rendered_cams = {}
+        base_z = -float(img_metas[0]['lidar2ego'][2, 3])
+        for cam_idx, filepath in enumerate(filename_list):
+            filename = osp.basename(filepath)
+            cam_name = filename.split('__')[1]
+            cam_img = cv2.imread(filepath)
+            lidar2img = build_raw_lidar2img(img_metas[0], cam_idx)
+            overlay_rendered_cams[cam_name] = render_anno_on_pv(cam_img, pred_dict, lidar2img, base_z=base_z)
          
         # surrounding view
         row_1_list = []
@@ -279,6 +450,10 @@ def main():
         cams_img = cv2.vconcat([row_1_img,row_2_img])
         cams_img_path = osp.join(sample_dir,'surroud_view.jpg')
         cv2.imwrite(cams_img_path, cams_img,[cv2.IMWRITE_JPEG_QUALITY, 70])
+
+        overlay_cams_img = build_overlay_canvas(overlay_rendered_cams)
+        overlay_cams_img_path = osp.join(sample_dir, 'PRED_overlay_surround.png')
+        cv2.imwrite(overlay_cams_img_path, overlay_cams_img)
         
         for vis_format in args.gt_format:
             if vis_format == 'se_pts':
@@ -350,21 +525,6 @@ def main():
                 logger.error(f'WRONG visformat for GT: {vis_format}')
                 raise ValueError(f'WRONG visformat for GT: {vis_format}')
 
-
-        # import pdb;pdb.set_trace()
-        plt.figure(figsize=(2, 4))
-        plt.xlim(pc_range[0], pc_range[3])
-        plt.ylim(pc_range[1], pc_range[4])
-        plt.axis('off')
-
-        # visualize pred
-        # import pdb;pdb.set_trace()
-        result_dic = result[0]['pts_bbox']
-        boxes_3d = result_dic['boxes_3d'] # bbox: xmin, ymin, xmax, ymax
-        scores_3d = result_dic['scores_3d']
-        labels_3d = result_dic['labels_3d']
-        pts_3d = result_dic['pts_3d']
-        keep = scores_3d > args.score_thresh
 
         plt.figure(figsize=(2, 4))
         plt.xlim(pc_range[0], pc_range[3])
